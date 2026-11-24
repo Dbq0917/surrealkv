@@ -955,8 +955,9 @@ impl CommitPipeline {
 		let vlog_threshold = self.inner.vlog.is_some().then_some(opts.vlog_value_threshold);
 		batch.prepare_inline(vlog_threshold, opts.enable_versioning)?;
 
-		// Write stall backpressure
-		self.write_stall.check().await?;
+		// Write stall backpressure. The byte estimate lets an engaged adaptive pacer spread a
+		// sustained event-stream peak at the compaction-backed rate.
+		self.write_stall.check_bytes(batch.size).await?;
 
 		#[cfg(test)]
 		self.fire_commit(CommitStage::Entered);

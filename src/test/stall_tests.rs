@@ -564,6 +564,95 @@ fn test_pacing_does_not_need_the_time_driver() {
 	}
 }
 
+#[test(tokio::test)]
+async fn compaction_backlog_recovery_releases_adaptive_pacing() {
+	use crate::write_pressure::WritePressureConfig;
+
+	let provider = Arc::new(MockStallCountProvider::new(3, 0));
+	let config = WritePressureConfig {
+		burst_budget_load_seconds: 0.0,
+		pressure_smoothing: Duration::from_millis(10),
+		min_rate: 0.25,
+		recovery_rate_per_second: 8.0,
+		decrease_rate_per_second: 50.0,
+	};
+	let controller = Arc::new(WriteStallController::with_config(
+		Arc::clone(&provider) as Arc<dyn WriteStallCountProvider>,
+		StallThresholds::new(4, 12),
+		config,
+	));
+
+	for _ in 0..50 {
+		controller.check().await.unwrap();
+		time::sleep(Duration::from_millis(10)).await;
+		if controller.pressure_decision().engaged
+			&& controller.pressure_decision().allowed_rate < 0.8
+		{
+			break;
+		}
+	}
+
+	let pressured = controller.pressure_decision();
+	assert!(pressured.engaged, "sustained compaction pressure did not engage: {pressured:?}");
+	assert!(pressured.allowed_rate < 0.8, "pacing stayed too weak: {pressured:?}");
+
+	// The flush/compaction backlog clears. Unlike a gate derived from retained WAL bytes, this must
+	// notice the resource count falling and return writers to full speed without a multi-minute
+	// catch-up wait.
+	provider.set_counts(0, 0);
+	for _ in 0..100 {
+		controller.check().await.unwrap();
+		time::sleep(Duration::from_millis(10)).await;
+		if !controller.pressure_decision().engaged {
+			break;
+		}
+	}
+
+	let recovered = controller.pressure_decision();
+	assert!(!recovered.engaged, "pacing did not clear: {recovered:?}");
+	assert_eq!(recovered.allowed_rate, 1.0);
+}
+
+#[test(tokio::test)]
+async fn l0_bytes_are_the_byte_level_pressure_signal() {
+	use crate::stall::CompactionPressure;
+
+	struct BytePressureProvider {
+		pressure: CompactionPressure,
+	}
+
+	impl WriteStallCountProvider for BytePressureProvider {
+		fn get_stall_counts(&self) -> StallCounts {
+			StallCounts {
+				immutable_memtables: 0,
+				l0_files: 0,
+			}
+		}
+
+		fn get_compaction_pressure(&self) -> CompactionPressure {
+			self.pressure
+		}
+	}
+
+	let provider = Arc::new(BytePressureProvider {
+		pressure: CompactionPressure {
+			l0_bytes: 300,
+			l0_byte_target: 100,
+			immutable_bytes: 0,
+			backlog_bytes: 300,
+		},
+	});
+	let controller = WriteStallController::new(provider, default_thresholds());
+
+	controller.check().await.unwrap();
+
+	let decision = controller.pressure_decision();
+	assert!(
+		(2.9..=3.1).contains(&decision.pressure),
+		"L0 bytes did not drive compaction pressure: {decision:?}"
+	);
+}
+
 /// Writers stalled on level 0 are let go, however the compactions are scheduled. The levels are
 /// small, so a level below level 0 often has the highest score and is merged first, and level 0
 /// stalls at the size that triggers its compaction. Each flush used to run one merge, and a

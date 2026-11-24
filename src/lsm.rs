@@ -25,7 +25,7 @@ use crate::lockfile::LockFile;
 use crate::memtable::{ImmutableEntry, ImmutableMemtables, MemTable};
 use crate::snapshot::SnapshotTracker;
 use crate::sstable::table::Table;
-use crate::stall::{StallCounts, StallThresholds, WriteStallCountProvider};
+use crate::stall::{CompactionPressure, StallCounts, StallThresholds, WriteStallCountProvider};
 use crate::task::TaskManager;
 use crate::transaction::{Mode, Transaction, TransactionOptions};
 use crate::vfs::{CreateOpts, Fs, FsKind, FsWriter};
@@ -2137,6 +2137,31 @@ impl WriteStallCountProvider for CoreInner {
 		StallCounts {
 			immutable_memtables: self.immutable_count(),
 			l0_files: self.l0_file_count(),
+		}
+	}
+
+	fn get_compaction_pressure(&self) -> CompactionPressure {
+		let l0_bytes = self
+			.level_manifest
+			.read()
+			.ok()
+			.and_then(|manifest| {
+				manifest.levels.get_levels().first().map(|level| {
+					level.tables.iter().map(|table| table.meta.properties.data_size).sum::<u64>()
+				})
+			})
+			.unwrap_or(0);
+		let immutable_bytes = self
+			.immutable_memtables
+			.read()
+			.map(|immutables| immutables.total_size() as u64)
+			.unwrap_or(0);
+
+		CompactionPressure {
+			l0_bytes,
+			l0_byte_target: self.opts.max_bytes_for_level,
+			immutable_bytes,
+			backlog_bytes: l0_bytes.saturating_add(immutable_bytes),
 		}
 	}
 }

@@ -57,6 +57,7 @@ pub(crate) mod varint;
 mod vfs;
 mod vlog;
 mod wal;
+mod write_pressure;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod test;
