@@ -188,6 +188,39 @@ async fn damage_to_bytes_a_later_mark_says_were_synced_is_refused() {
 	assert!(err.to_string().contains("interior corruption"), "{err}");
 }
 
+/// A whole block lost from the middle of a synced segment, the blocks around it intact: the
+/// reader took the zeros for the padding of a block once, and replayed the records after them
+/// as if nothing were missing. The open must refuse the segment instead: the commits of the
+/// lost block are gone, and starting without them is not an option.
+#[test_log::test(tokio::test)]
+async fn a_zeroed_block_inside_a_synced_segment_is_refused() {
+	let dir = TempDir::new().unwrap();
+	let o = opts(dir.path(), true);
+	let tree = Tree::new(Arc::clone(&o)).unwrap();
+	let segment = active_segment(&tree, &o);
+	// 4 KB values: a block holds a few commits, and the segment spans several.
+	for i in 0..40 {
+		put_value(&tree, &format!("k{i:02}"), &[b'v'; 4096], Durability::Immediate).await;
+	}
+	crash(tree);
+	let size = len(&segment);
+	assert!(size >= 3 * BLOCK_SIZE as u64, "the segment spans at least 3 blocks: {size}");
+
+	// The second block is lost: every byte of it reads as zero, as a lost write leaves it.
+	zero(&segment, BLOCK_SIZE as u64..2 * BLOCK_SIZE as u64);
+
+	let err = Tree::new(Arc::clone(&o))
+		.err()
+		.expect("a block lost from the middle of the segment must be refused");
+	assert!(err.to_string().contains("interior corruption"), "{err}");
+
+	let strict = Arc::new(Options {
+		wal_recovery_mode: WalRecoveryMode::AbsoluteConsistency,
+		..(*o).clone()
+	});
+	Tree::new(strict).err().expect("AbsoluteConsistency refuses any damage");
+}
+
 fn records(sizes: &[usize], fill: u8) -> (Vec<u8>, Vec<usize>) {
 	let mut buf = Vec::new();
 	let mut ends = Vec::new();

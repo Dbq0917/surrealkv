@@ -1,6 +1,6 @@
 //! WAL Recovery Tests
 
-use std::io::Write;
+use std::io::{Seek, Write};
 
 use tempfile::TempDir;
 use test_log::test;
@@ -620,6 +620,52 @@ fn test_corruption_last_segment() {
 			// Corruption stops recovery immediately - no memtables returned
 		}
 		_ => panic!("Expected WalCorruption error in segment 4"),
+	}
+}
+
+#[test]
+fn test_zeroed_block_inside_segment_is_corruption() {
+	let temp_dir = TempDir::new().unwrap();
+	let wal_dir = temp_dir.path();
+	fs::create_dir_all(wal_dir).unwrap();
+
+	// One segment whose records span several blocks: a batch of 1 KB values takes
+	// about a block per 31 records.
+	let mut wal = Wal::open(wal_dir, tfs::wal_options_for(wal_dir)).unwrap();
+	for batch_index in 0..8 {
+		let mut batch = Batch::new(1000 + batch_index * 40);
+		for i in 0..40 {
+			let key = format!("key{:05}", batch_index * 40 + i);
+			batch.set(key.into_bytes(), vec![b'v'; 1024], 0).unwrap();
+		}
+		wal.append(&batch.encode().unwrap()).unwrap();
+	}
+	wal.close().unwrap();
+
+	// A block in the middle of the segment is lost: every byte of it reads as zero,
+	// as a lost write leaves it. The blocks before and after it are intact.
+	let segment_path = wal_dir.join("00000000000000000000.wal");
+	let file_size = fs::metadata(&segment_path).unwrap().len();
+	assert!(
+		file_size >= 3 * crate::wal::BLOCK_SIZE as u64,
+		"the segment spans at least 3 blocks, got {file_size}"
+	);
+	let mut file = std::fs::OpenOptions::new().write(true).open(&segment_path).unwrap();
+	file.seek(std::io::SeekFrom::Start(crate::wal::BLOCK_SIZE as u64)).unwrap();
+	file.write_all(&vec![0u8; crate::wal::BLOCK_SIZE]).unwrap();
+	drop(file);
+
+	// Replay must report the hole, not skip to the records after it: the batches of
+	// the lost block are otherwise neither applied nor reported.
+	let result = replay_wal(wal_dir, 0, ARENA_SIZE);
+	match result {
+		Err(Error::WalCorruption {
+			segment_id,
+			..
+		}) => {
+			assert_eq!(segment_id, 0);
+		}
+		_ => panic!("Expected WalCorruption error for a zeroed block inside segment 0"),
 	}
 }
 

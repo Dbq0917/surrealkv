@@ -115,6 +115,11 @@ pub(crate) struct Reader {
 
 	/// The length that the header of that record gave, if its header was read.
 	parsed_length: Option<usize>,
+
+	/// Whether a run of zeros longer than any padding a writer writes was read: the
+	/// preallocated tail of the segment, or a region that was lost. Anything but
+	/// zeros after it is damage, not the end of the records.
+	zeroed_tail: bool,
 }
 
 impl Reader {
@@ -137,6 +142,7 @@ impl Reader {
 			sealed: None,
 			record_start: 0,
 			parsed_length: None,
+			zeroed_tail: false,
 			file: FsCursor::new(file.into_fs_file()),
 			buffer: Box::new([0; BLOCK_SIZE]),
 			buffer_offset: 0,
@@ -373,6 +379,19 @@ impl Reader {
 			// Parse header from buffer
 			let (crc, length, type_byte) = self.parse_header();
 
+			// A run of zeros longer than the padding a writer writes is the end of
+			// the records only while nothing but zeros follows it, as the
+			// preallocated tail of a segment is. A record after it is damage that
+			// was skipped, not padding: the records of the zeroed region are lost,
+			// and replaying what follows them as if nothing happened is not an
+			// option.
+			if self.zeroed_tail && (crc != 0 || length != 0 || type_byte != 0) {
+				return Err(Error::IO(IOError::new(
+					io::ErrorKind::Other,
+					"non-zero data after a zeroed region",
+				)));
+			}
+
 			// A segment that starts with the header record of a sealed segment is not a plaintext
 			// segment, and nothing in it is read as one: a WAL that is not configured for
 			// encryption does not repair it either.
@@ -396,6 +415,14 @@ impl Reader {
 							"non-zero byte in padding area",
 						)));
 					}
+				}
+				// The writer pads a block with zeros only before a sync mark, and
+				// then by less than HEADER_SIZE + SYNC_MARK_LEN bytes in all, so
+				// less than SYNC_MARK_LEN of them follow the zero header. A longer
+				// run is the preallocated tail of the segment or a region that was
+				// lost: what follows it decides which, see the check above.
+				if remaining >= SYNC_MARK_LEN {
+					self.zeroed_tail = true;
 				}
 				// Discard rest of buffer and continue (read_more will be called next iteration)
 				self.buffer_offset = self.buffer_end;
